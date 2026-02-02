@@ -19,11 +19,16 @@ from rat.data_processing.newdata import get_newdata
 from rat.data_processing.newdata_low_latency import get_newdata_low_latency
 
 from rat.data_processing.metsim_input_processing import CombinedNC,generate_state_and_inputs, generate_metsim_state_and_inputs_with_multiple_nc_files
+from rat.data_processing.cwatm_input_processing import generate_cwatm_state_and_inputs, CWatMForcingProcessor
 from rat.utils.metsim_param_reader import MSParameterFile
 from rat.core.run_metsim import MetSimRunner
 
 from rat.utils.vic_param_reader import VICParameterFile
 from rat.core.run_vic import VICRunner
+
+# CWatM imports for alternative hydrological model
+from rat.utils.cwatm_param_reader import CWatMParameterFile
+from rat.core.run_cwatm import CWatMRunner
 
 from rat.utils.route_param_reader import RouteParameterFile
 from rat.core.run_routing import RoutingRunner, generate_inflow, run_routing
@@ -185,6 +190,15 @@ def rat_basin(config, rat_logger, forecast_mode=False, gfs_days=0, forecast_base
         # swot plugin
         run_swot_plugin = config.get('PLUGINS',{}).get('swot',False)
 
+        ## Hydrological Model Selection
+        # Determine which hydrological model to use (VIC or CWatM)
+        hydro_model = config['GLOBAL'].get('hydrological_model', 'vic').lower()
+        use_cwatm = (hydro_model == 'cwatm')
+        if use_cwatm:
+            rat_logger.info(f"Using CWatM as the hydrological model")
+        else:
+            rat_logger.info(f"Using VIC as the hydrological model")
+
         # Defining logger
         log, log_file_path = init_logger(
             log_dir= log_dir,
@@ -279,6 +293,20 @@ def rat_basin(config, rat_logger, forecast_mode=False, gfs_days=0, forecast_base
             rout_input_state_folder = create_directory(os.path.join(basin_data_dir,'ro','rout_state_file',''), True)
             init_state_out_dir = 'vic_init_states'
         init_state_in_dir = 'vic_init_states'
+
+        #----------- Paths Necessary for running of CWatM (if selected) -----------#
+        if use_cwatm:
+            cwatm_input_path = create_directory(os.path.join(basin_data_dir, 'cwatm', 'cwatm_inputs',''), True)
+            if forecast_mode:
+                cwatm_output_path = create_directory(os.path.join(basin_data_dir,'cwatm','forecast_cwatm_outputs',''), True)
+                cwatm_init_state_out_dir = 'forecast_cwatm_init_states'
+            else:
+                cwatm_output_path = create_directory(os.path.join(basin_data_dir,'cwatm','cwatm_outputs',''), True)
+                cwatm_init_state_out_dir = 'cwatm_init_states'
+            cwatm_init_state_in_dir = 'cwatm_init_states'
+            # CWatM uses same routing input path as VIC
+            cwatm_forcing_path = os.path.join(cwatm_input_path, 'forcing.nc')
+        #----------- Paths Necessary for running of CWatM -----------#
         # Defining path of routing state file to use
         if(isinstance(rout_init_state, str)):
             rout_input_state_file = Path(rout_init_state).resolve()
@@ -531,110 +559,250 @@ def rat_basin(config, rat_logger, forecast_mode=False, gfs_days=0, forecast_base
     if(4 in steps):
         try:
             if(NEW_DATA_STATUS):
-                rat_logger.info("Starting Step-4: Running MetSim & preparation of VIC input")
-                ##-------------- Metsim Begin & Pre-processing for VIC --------------##
-                with MSParameterFile(
-                        start= config['BASIN']['start'],
-                        end= config['BASIN']['end'],
-                        init_param= config['METSIM']['metsim_param_file'],
-                        out_dir= str(metsim_output_path), 
-                        forcings=str(ms_input_data),
-                        state=str(ms_state),
-                        domain= str(domain_nc_path)
-                    ) as m:
-                    
-                    ms = MetSimRunner(
-                        param_path= m.ms_param_path,
-                        metsim_env= config['METSIM']['metsim_env'],
-                        results_path= m.results,
-                        multiprocessing= config['GLOBAL']['multiprocessing']
-                    )
-                    log.log(NOTIFICATION, f'Starting metsim from {config["BASIN"]["start"].strftime("%Y-%m-%d")} to {config["BASIN"]["end"].strftime("%Y-%m-%d")}')
-                    ms.run_metsim()
-                    ms.convert_to_vic_forcings(vic_input_path)
-                METSIM_STATUS=1    #Metsim run successfully
+                if use_cwatm:
+                    rat_logger.info("Starting Step-4: Preparation of CWatM input forcing")
+                    ##-------------- CWatM Forcing Preparation --------------##
+                    try:
+                        # Option 1: Process through MetSim first (recommended for consistency)
+                        if config.get('CWATM', {}).get('use_metsim', True):
+                            with MSParameterFile(
+                                    start= config['BASIN']['start'],
+                                    end= config['BASIN']['end'],
+                                    init_param= config['METSIM']['metsim_param_file'],
+                                    out_dir= str(metsim_output_path),
+                                    forcings=str(ms_input_data),
+                                    state=str(ms_state),
+                                    domain= str(domain_nc_path)
+                                ) as m:
+
+                                ms = MetSimRunner(
+                                    param_path= m.ms_param_path,
+                                    metsim_env= config['METSIM']['metsim_env'],
+                                    results_path= m.results,
+                                    multiprocessing= config['GLOBAL']['multiprocessing']
+                                )
+                                log.log(NOTIFICATION, f'Starting metsim from {config["BASIN"]["start"].strftime("%Y-%m-%d")} to {config["BASIN"]["end"].strftime("%Y-%m-%d")}')
+                                ms.run_metsim()
+
+                                # Convert MetSim output to CWatM format
+                                cwatm_processor = CWatMForcingProcessor(cwatm_input_path)
+                                cwatm_forcing_path = cwatm_processor.process_metsim_output(
+                                    metsim_path=m.results,
+                                    start_date=config['BASIN']['start'],
+                                    end_date=config['BASIN']['end']
+                                )
+                        else:
+                            # Option 2: Directly convert combined NetCDF to CWatM format
+                            log.log(NOTIFICATION, 'Preparing CWatM forcing directly from combined data')
+                            cwatm_state, cwatm_forcing_path = generate_cwatm_state_and_inputs(
+                                forcings_startdate=config['BASIN']['start'],
+                                forcings_enddate=config['BASIN']['end'],
+                                combined_datapath=combined_datapath,
+                                out_dir=cwatm_input_path
+                            )
+                        METSIM_STATUS=1
+                    except Exception as e:
+                        rat_logger.exception(f"Error preparing CWatM forcing: {e}")
+                        METSIM_STATUS=0
+                    ##--------------- CWatM Forcing Preparation done --------------##
+                else:
+                    rat_logger.info("Starting Step-4: Running MetSim & preparation of VIC input")
+                    ##-------------- Metsim Begin & Pre-processing for VIC --------------##
+                    with MSParameterFile(
+                            start= config['BASIN']['start'],
+                            end= config['BASIN']['end'],
+                            init_param= config['METSIM']['metsim_param_file'],
+                            out_dir= str(metsim_output_path),
+                            forcings=str(ms_input_data),
+                            state=str(ms_state),
+                            domain= str(domain_nc_path)
+                        ) as m:
+
+                        ms = MetSimRunner(
+                            param_path= m.ms_param_path,
+                            metsim_env= config['METSIM']['metsim_env'],
+                            results_path= m.results,
+                            multiprocessing= config['GLOBAL']['multiprocessing']
+                        )
+                        log.log(NOTIFICATION, f'Starting metsim from {config["BASIN"]["start"].strftime("%Y-%m-%d")} to {config["BASIN"]["end"].strftime("%Y-%m-%d")}')
+                        ms.run_metsim()
+                        ms.convert_to_vic_forcings(vic_input_path)
+                    METSIM_STATUS=1    #Metsim run successfully
+                    ##--------------- Metsim End & Pre-processing for VIC done--------------##
             else:
-                rat_logger.info("New Data Download Failed. Skipping Step-4: Running MetSim & preparation of VIC input")
+                rat_logger.info("New Data Download Failed. Skipping Step-4: Running MetSim/CWatM forcing preparation")
         except:
             no_errors = no_errors+1
-            rat_logger.exception("Error Executing Step-4: Running MetSim & preparation of VIC input")
+            if use_cwatm:
+                rat_logger.exception("Error Executing Step-4: Preparation of CWatM input forcing")
+            else:
+                rat_logger.exception("Error Executing Step-4: Running MetSim & preparation of VIC input")
         else:
-            rat_logger.info("Finished Step-4: Running MetSim & preparation of VIC input")
-            ##--------------- Metsim End & Pre-processing for VIC done--------------##
+            if use_cwatm:
+                rat_logger.info("Finished Step-4: Preparation of CWatM input forcing")
+            else:
+                rat_logger.info("Finished Step-4: Running MetSim & preparation of VIC input")
 
 
      ######### Step-5
     if(5 in steps):
         try:
-            rat_logger.info("Starting Step-5: Preparation of VIC Parameter Files")
-            ##--------------- Preparation of Vic Parameter Files begin--------------##
-            # If Vic Parameter is globally available and needs to be cropped
-            if(config['VIC']['vic_global_data']):
-                # Creating if not exist vic_basin_params dir 
-                vic_param_dir = os.path.join(basin_data_dir,'vic', 'vic_basin_params','')
-                create_directory(vic_param_dir)
+            if use_cwatm:
+                rat_logger.info("Starting Step-5: Preparation of CWatM Parameter Files")
+                ##--------------- Preparation of CWatM Parameter Files begin--------------##
+                # Create CWatM parameter directory
+                cwatm_param_dir = os.path.join(basin_data_dir, 'cwatm', 'cwatm_basin_params', '')
+                create_directory(cwatm_param_dir)
 
-                # Creating vic soil param and domain file if not present
-                if not os.path.exists(os.path.join(vic_param_dir,'vic_soil_param.nc')):
-                    global_vic_param_file = os.path.join(config['VIC']['vic_global_param_dir'],config['VIC']['vic_basin_continent_param_filename'])
-                    global_vic_domain_file = os.path.join(config['VIC']['vic_global_param_dir'],config['VIC']['vic_basin_continent_domain_filename'])
+                # If CWatM has global parameter files that need to be cropped
+                if config.get('CWATM', {}).get('cwatm_global_data', False):
+                    # Create basin-specific CWatM mask and parameter files
+                    rat_logger.info("Preparing basin-specific CWatM parameter files from global data")
+                    # CWatM parameter preparation would go here
+                    # For now, assume user provides pre-prepared basin-specific files
 
-                    create_vic_domain_param_file(global_vic_param_file,global_vic_domain_file,basingridfile_path,vic_param_dir)
-                
-                # Setting vic soil_param_file and domain file paths in config, will be used in vic_params produced by VICParameterFile
-                config['VIC']['vic_soil_param_file']=os.path.join(vic_param_dir,'vic_soil_param.nc')
-                config['VIC']['vic_domain_file']=os.path.join(vic_param_dir,'vic_domain.nc')
+                rat_logger.info("Finished Step-5: Preparation of CWatM Parameter Files")
+                ##--------------- Preparation of CWatM Parameter Files end--------------##
+            else:
+                rat_logger.info("Starting Step-5: Preparation of VIC Parameter Files")
+                ##--------------- Preparation of Vic Parameter Files begin--------------##
+                # If Vic Parameter is globally available and needs to be cropped
+                if(config['VIC']['vic_global_data']):
+                    # Creating if not exist vic_basin_params dir
+                    vic_param_dir = os.path.join(basin_data_dir,'vic', 'vic_basin_params','')
+                    create_directory(vic_param_dir)
+
+                    # Creating vic soil param and domain file if not present
+                    if not os.path.exists(os.path.join(vic_param_dir,'vic_soil_param.nc')):
+                        global_vic_param_file = os.path.join(config['VIC']['vic_global_param_dir'],config['VIC']['vic_basin_continent_param_filename'])
+                        global_vic_domain_file = os.path.join(config['VIC']['vic_global_param_dir'],config['VIC']['vic_basin_continent_domain_filename'])
+
+                        create_vic_domain_param_file(global_vic_param_file,global_vic_domain_file,basingridfile_path,vic_param_dir)
+
+                    # Setting vic soil_param_file and domain file paths in config, will be used in vic_params produced by VICParameterFile
+                    config['VIC']['vic_soil_param_file']=os.path.join(vic_param_dir,'vic_soil_param.nc')
+                    config['VIC']['vic_domain_file']=os.path.join(vic_param_dir,'vic_domain.nc')
+                rat_logger.info("Finished Step-5: Preparation of VIC Parameter Files")
+                ##--------------- Preparation of Vic Parameter Files end--------------##
         except:
             no_errors = no_errors+1
-            rat_logger.exception("Error Executing Step-5: Preparation of VIC Parameter Files")
-        else:
-            rat_logger.info("Finished Step-5: Preparation of VIC Parameter Files")
-            ##--------------- Preparation of Vic Parameter Files end--------------##
+            if use_cwatm:
+                rat_logger.exception("Error Executing Step-5: Preparation of CWatM Parameter Files")
+            else:
+                rat_logger.exception("Error Executing Step-5: Preparation of VIC Parameter Files")
     
     ######### Step-6
     if(6 in steps):
         try:
             if(METSIM_STATUS):
-                rat_logger.info("Starting Step-6: Running of VIC and preparation of Routing input")
-                ##--------------- VIC Begin & Pre-processing for Routing ----------------## 
-                with VICParameterFile(
-                    config = config,
-                    basin_name = basin_name,
-                    startdate = config['BASIN']['start'],
-                    enddate = config['BASIN']['end'],
-                    vic_output_path = vic_output_path,
-                    forcing_prefix = vic_input_forcing_path,
-                    init_state = vic_init_state,
-                    init_state_dir=init_state_in_dir,
-                    init_state_save_date= vic_init_state_save_date,
-                    init_state_out_dir=init_state_out_dir
-                ) as p:
-                    vic = VICRunner(
-                        vic_env= config['VIC']['vic_env'],
-                        param_file= p.vic_param_path,
-                        vic_result_file= p.vic_result_file,
-                        rout_input_dir= rout_input_path
-                    )
-                    vic.run_vic(np=config['GLOBAL']['multiprocessing'])
-                    vic.generate_routing_input_state(ndays=365, rout_input_state_file=rout_input_state_file, 
-                        save_path=rout_init_state_save_file, use_rout_state=use_state) # Start date of routing state file will be returned
-                    if(config['BASIN']['spin_up']):
-                        vic.disagg_results(rout_input_state_file=p.vic_result_file)       # If spin_up, use vic result file
-                    elif(config['BASIN'].get('vic_init_state')):                      # If vic_state file exists
-                        vic.disagg_results(rout_input_state_file=rout_init_state_save_file)    # If not spin_up, use rout_init_state_save file just creates as it contains the recent vic outputs.
-                    else:
-                        vic.disagg_results(rout_input_state_file=p.vic_result_file)       # If spin_up is false and vic state file does not exist, use vic result file
-                    vic_startdate = p.vic_startdate
-                    vic_enddate = p.vic_enddate
-                VIC_STATUS=1         #Vic run successfully
+                if use_cwatm:
+                    ##--------------- CWatM Begin & Pre-processing for Routing ----------------##
+                    rat_logger.info("Starting Step-6: Running of CWatM and preparation of Routing input")
+
+                    # Get CWatM init state if available
+                    cwatm_init_state = config['BASIN'].get('cwatm_init_state', vic_init_state)
+
+                    with CWatMParameterFile(
+                        config = config,
+                        basin_name = basin_name,
+                        startdate = config['BASIN']['start'],
+                        enddate = config['BASIN']['end'],
+                        cwatm_output_path = cwatm_output_path,
+                        forcing_path = cwatm_forcing_path,
+                        init_state = cwatm_init_state,
+                        init_state_dir = cwatm_init_state_in_dir,
+                        init_state_save_date = vic_init_state_save_date,
+                        init_state_out_dir = cwatm_init_state_out_dir
+                    ) as p:
+                        cwatm = CWatMRunner(
+                            config = config,
+                            basin_name = basin_name
+                        )
+
+                        # Setup CWatM
+                        cwatm.setup(
+                            start_date = config['BASIN']['start'],
+                            end_date = config['BASIN']['end'],
+                            forcing_path = cwatm_forcing_path,
+                            output_path = cwatm_output_path,
+                            init_state = cwatm_init_state,
+                            save_state = True,
+                            settings_file = p.cwatm_settings_path
+                        )
+
+                        # Run CWatM
+                        ret_code = cwatm.run(num_processors=config['GLOBAL']['multiprocessing'])
+
+                        if ret_code == 0:
+                            # Generate routing input state
+                            cwatm.generate_routing_input_state(
+                                ndays=365,
+                                rout_input_state_file=rout_input_state_file,
+                                save_path=rout_init_state_save_file,
+                                use_rout_state=use_state
+                            )
+
+                            # Prepare routing input (disaggregate CWatM results)
+                            cwatm.prepare_routing_input(
+                                rout_input_dir=rout_input_path,
+                                rout_input_state_file=rout_init_state_save_file if use_state else None,
+                                use_rout_state=use_state
+                            )
+
+                            vic_startdate = p.cwatm_startdate
+                            vic_enddate = p.cwatm_enddate
+                            VIC_STATUS = 1  # Model run successfully (using VIC_STATUS for compatibility)
+                        else:
+                            rat_logger.error("CWatM execution failed")
+                            VIC_STATUS = 0
+                    ##---------------- CWatM End & Results pre-processed for Routing-----------------##
+                else:
+                    ##--------------- VIC Begin & Pre-processing for Routing ----------------##
+                    rat_logger.info("Starting Step-6: Running of VIC and preparation of Routing input")
+                    with VICParameterFile(
+                        config = config,
+                        basin_name = basin_name,
+                        startdate = config['BASIN']['start'],
+                        enddate = config['BASIN']['end'],
+                        vic_output_path = vic_output_path,
+                        forcing_prefix = vic_input_forcing_path,
+                        init_state = vic_init_state,
+                        init_state_dir=init_state_in_dir,
+                        init_state_save_date= vic_init_state_save_date,
+                        init_state_out_dir=init_state_out_dir
+                    ) as p:
+                        vic = VICRunner(
+                            vic_env= config['VIC']['vic_env'],
+                            param_file= p.vic_param_path,
+                            vic_result_file= p.vic_result_file,
+                            rout_input_dir= rout_input_path
+                        )
+                        vic.run_vic(np=config['GLOBAL']['multiprocessing'])
+                        vic.generate_routing_input_state(ndays=365, rout_input_state_file=rout_input_state_file,
+                            save_path=rout_init_state_save_file, use_rout_state=use_state) # Start date of routing state file will be returned
+                        if(config['BASIN']['spin_up']):
+                            vic.disagg_results(rout_input_state_file=p.vic_result_file)       # If spin_up, use vic result file
+                        elif(config['BASIN'].get('vic_init_state')):                      # If vic_state file exists
+                            vic.disagg_results(rout_input_state_file=rout_init_state_save_file)    # If not spin_up, use rout_init_state_save file just creates as it contains the recent vic outputs.
+                        else:
+                            vic.disagg_results(rout_input_state_file=p.vic_result_file)       # If spin_up is false and vic state file does not exist, use vic result file
+                        vic_startdate = p.vic_startdate
+                        vic_enddate = p.vic_enddate
+                    VIC_STATUS=1         #Vic run successfully
+                    ##---------------- VIC End & Results pre-processed for Routing-----------------##
             else:
-                rat_logger.info("MetSim Run Failed. Skipping Step-6: Running of VIC and preparation of Routing input")
+                rat_logger.info("MetSim Run Failed. Skipping Step-6: Running of hydrological model and preparation of Routing input")
         except:
             no_errors = no_errors+1
-            rat_logger.exception("Error Executing Step-6: Running of VIC and preparation of Routing input")
+            if use_cwatm:
+                rat_logger.exception("Error Executing Step-6: Running of CWatM and preparation of Routing input")
+            else:
+                rat_logger.exception("Error Executing Step-6: Running of VIC and preparation of Routing input")
         else:
-            rat_logger.info("Finished Step-6: Running of VIC and preparation of Routing input")
-            ##---------------- VIC End & Results pre-processed for Routing-----------------##
+            if use_cwatm:
+                rat_logger.info("Finished Step-6: Running of CWatM and preparation of Routing input")
+            else:
+                rat_logger.info("Finished Step-6: Running of VIC and preparation of Routing input")
 
 
     ######### Step-7
@@ -806,7 +974,7 @@ def rat_basin(config, rat_logger, forecast_mode=False, gfs_days=0, forecast_base
                 copy_aec_files(aec_dir_path, aec_savedir)
             except:
                 rat_logger.warning("AEC files could not be copied to rat_outputs directory.", exc_info=True)
-            #Generating evaporation, storage change and outflow.    
+            #Generating evaporation, storage change and outflow.
             DELS_STATUS, EVAP_STATUS, OUTFLOW_STATUS = run_postprocessing(
                                                 basin_name=basin_name,
                                                 basin_data_dir=basin_data_dir,
@@ -827,7 +995,8 @@ def rat_basin(config, rat_logger, forecast_mode=False, gfs_days=0, forecast_base
                                                 gee_status=GEE_STATUS,
                                                 swot_run=run_swot_plugin,
                                                 swot_post_processing_paths=swot_post_processing_paths,
-                                                forecast_mode=forecast_mode
+                                                forecast_mode=forecast_mode,
+                                                hydro_model=hydro_model
                                             )
         except:
             no_errors = no_errors+1

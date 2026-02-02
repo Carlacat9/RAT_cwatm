@@ -18,6 +18,29 @@ from rat.utils.science import penman
 log = getLogger(f"{LOG_NAME}.{__name__}")
 log_level1 = getLogger(f"{LOG_LEVEL1_NAME}.{__name__}")
 
+# Variable name mappings for different hydrological models
+VIC_VAR_MAPPING = {
+    'net_radiation': 'OUT_R_NET',
+    'vapor_pressure': 'OUT_VP',
+    'wind_speed': 'OUT_WIND',
+    'air_temperature': 'OUT_AIR_TEMP',
+    'runoff': 'OUT_RUNOFF',
+    'baseflow': 'OUT_BASEFLOW',
+    'evaporation': 'OUT_EVAP',
+    'precipitation': 'OUT_PREC',
+}
+
+CWATM_VAR_MAPPING = {
+    'net_radiation': 'Rn',  # Net radiation from CWatM
+    'vapor_pressure': 'VP',  # Vapor pressure (may need calculation)
+    'wind_speed': 'Wind',  # Wind speed
+    'air_temperature': 'Tavg',  # Average temperature
+    'runoff': 'runoff',
+    'baseflow': 'baseflow',
+    'evaporation': 'totalET',
+    'precipitation': 'Precipitation',
+}
+
 def calc_dels(aecpath, savepath, sareapath=None, elevpath=None, using="area"):
     """
     Calculate storage change (ΔS) from reservoir area-elevation curves and 
@@ -115,10 +138,40 @@ def calc_dels(aecpath, savepath, sareapath=None, elevpath=None, using="area"):
     # Save output
     df.to_csv(savepath, index=False)
 
-def calc_E(res_data, start_date, end_date, forcings_path, vic_res_path, sarea, savepath, forecast_mode=False):
+def calc_E(res_data, start_date, end_date, forcings_path, vic_res_path, sarea, savepath, forecast_mode=False, hydro_model='vic'):
+    """
+    Calculate evaporation for a reservoir using the Penman equation.
+
+    Parameters
+    ----------
+    res_data : GeoDataFrame row
+        Reservoir geometry and attributes
+    start_date : str
+        Start date for calculation
+    end_date : str
+        End date for calculation
+    forcings_path : str
+        Path to forcing data files (glob pattern)
+    vic_res_path : str
+        Path to hydrological model results (VIC or CWatM)
+    sarea : str or float
+        Surface area file path or constant value
+    savepath : str
+        Output file path
+    forecast_mode : bool
+        Whether running in forecast mode
+    hydro_model : str
+        Hydrological model type ('vic' or 'cwatm')
+    """
+    # Select variable mapping based on model
+    if hydro_model.lower() == 'cwatm':
+        var_map = CWATM_VAR_MAPPING
+    else:
+        var_map = VIC_VAR_MAPPING
+
     # Initialize existing_data to None
     existing_data = None
-    # If vic result file exists, then use that to calculate evaporation
+    # If model result file exists, then use that to calculate evaporation
     if os.path.isfile(vic_res_path) and glob.glob(forcings_path):
         ds = xr.open_dataset(vic_res_path)
         forcings_ds = xr.open_mfdataset(forcings_path, engine='netcdf4')
@@ -134,17 +187,54 @@ def calc_E(res_data, start_date, end_date, forcings_path, vic_res_path, sarea, s
 
         log.debug(f"Bounds: {res_buf.bounds}")
         log.debug("Clipping forcings")
-        forcings_ds_clipped = forcings_ds['air_pressure'].sel(lon=slice(minx, maxx), lat=slice(maxy, miny))
-        forcings = forcings_ds_clipped.load()
-        
-        log.debug("Clipping VIC results")
-        ds_clipped = ds.sel(lon=slice(minx, maxx), lat=slice(maxy, miny))
-        reqvars_clipped = ds_clipped[['OUT_R_NET', 'OUT_VP', 'OUT_WIND', 'OUT_AIR_TEMP']]
+
+        # Handle different coordinate naming conventions
+        lon_coord = 'lon' if 'lon' in forcings_ds.dims else 'longitude' if 'longitude' in forcings_ds.dims else 'x'
+        lat_coord = 'lat' if 'lat' in forcings_ds.dims else 'latitude' if 'latitude' in forcings_ds.dims else 'y'
+
+        # Get pressure variable (name may vary)
+        pressure_var = 'air_pressure' if 'air_pressure' in forcings_ds else 'Pressure' if 'Pressure' in forcings_ds else None
+        if pressure_var:
+            forcings_ds_clipped = forcings_ds[pressure_var].sel(**{lon_coord: slice(minx, maxx), lat_coord: slice(maxy, miny)})
+        else:
+            # If no pressure variable, create dummy pressure (use standard atmospheric pressure)
+            log.warning("No pressure variable found in forcings, using standard atmospheric pressure")
+            forcings_ds_clipped = None
+        forcings = forcings_ds_clipped.load() if forcings_ds_clipped is not None else None
+
+        log.debug(f"Clipping {hydro_model.upper()} results")
+
+        # Handle coordinate naming for model outputs
+        ds_lon = 'lon' if 'lon' in ds.dims else 'longitude' if 'longitude' in ds.dims else 'x'
+        ds_lat = 'lat' if 'lat' in ds.dims else 'latitude' if 'latitude' in ds.dims else 'y'
+        ds_clipped = ds.sel(**{ds_lon: slice(minx, maxx), ds_lat: slice(maxy, miny)})
+
+        # Get required variables using mapping (handle missing variables)
+        required_vars = ['net_radiation', 'vapor_pressure', 'wind_speed', 'air_temperature']
+        available_vars = []
+        rename_dict = {}
+
+        for req_var in required_vars:
+            model_var = var_map.get(req_var)
+            if model_var and model_var in ds_clipped.data_vars:
+                available_vars.append(model_var)
+                # Rename to VIC-style names for compatibility with existing penman calculation
+                rename_dict[model_var] = VIC_VAR_MAPPING[req_var]
+
+        if len(available_vars) < len(required_vars):
+            missing = [v for v in required_vars if var_map.get(v) not in ds_clipped.data_vars]
+            log.warning(f"Missing variables for evaporation calculation: {missing}")
+
+        reqvars_clipped = ds_clipped[available_vars]
+        reqvars_clipped = reqvars_clipped.rename(rename_dict)
         reqvars = reqvars_clipped.load()
         
         log.debug("Checking if grid cells lie inside reservoir")
         last_layer = reqvars.isel(time=-1).to_dataframe().reset_index()
-        temp_gdf = gpd.GeoDataFrame(last_layer, geometry=gpd.points_from_xy(last_layer.lon, last_layer.lat))
+        # Handle different coordinate naming
+        lon_col = 'lon' if 'lon' in last_layer.columns else 'longitude' if 'longitude' in last_layer.columns else 'x'
+        lat_col = 'lat' if 'lat' in last_layer.columns else 'latitude' if 'latitude' in last_layer.columns else 'y'
+        temp_gdf = gpd.GeoDataFrame(last_layer, geometry=gpd.points_from_xy(last_layer[lon_col], last_layer[lat_col]))
         log.debug('Calculating points within')
         points_within = temp_gdf[temp_gdf.within(res_geom)]['geometry']
 
@@ -299,7 +389,7 @@ def calc_outflow(inflowpath, dspath, epath, area, savepath):
 
 
 def run_postprocessing(basin_name, basin_data_dir, reservoir_shpfile, reservoir_shpfile_column_dict, aec_dir_path, start_date, end_date, rout_init_state_save_file, use_rout_state,
-                            evap_datadir, dels_savedir, elevation_savedir, nssc_savedir, outflow_savedir, vic_status, routing_status, gee_status, swot_run=False, swot_post_processing_paths=None, forecast_mode=False):
+                            evap_datadir, dels_savedir, elevation_savedir, nssc_savedir, outflow_savedir, vic_status, routing_status, gee_status, swot_run=False, swot_post_processing_paths=None, forecast_mode=False, hydro_model='vic'):
     # read file defining mapped resrvoirs
     # reservoirs_fn = os.path.join(project_dir, 'backend/data/ancillary/RAT-Reservoirs.geojson')
     if os.path.isfile(reservoir_shpfile):
@@ -453,17 +543,39 @@ def run_postprocessing(basin_name, basin_data_dir, reservoir_shpfile, reservoir_
         log.debug("Retrieving Evaporation")
         no_failed_files = 0
         no_swot_failed_files = 0
-        if(use_rout_state):
-            vic_results_path = rout_init_state_save_file
-        else:
-            if forecast_mode:
-                vic_results_path = os.path.join(basin_data_dir,'vic', 'forecast_vic_outputs', "nc_fluxes."+start_date_str+".nc")
+
+        # Determine model output paths based on hydrological model type
+        if hydro_model.lower() == 'cwatm':
+            if(use_rout_state):
+                model_results_path = rout_init_state_save_file
             else:
-                vic_results_path = os.path.join(basin_data_dir,'vic', "vic_outputs/nc_fluxes."+start_date_str+".nc")
-        if forecast_mode:
-            forcings_path = os.path.join(basin_data_dir,'vic', 'forecast_vic_inputs/*.nc')
+                if forecast_mode:
+                    model_results_path = os.path.join(basin_data_dir,'cwatm', 'forecast_cwatm_outputs', "*.nc")
+                else:
+                    model_results_path = os.path.join(basin_data_dir,'cwatm', "cwatm_outputs/*.nc")
+            if forecast_mode:
+                forcings_path = os.path.join(basin_data_dir,'cwatm', 'cwatm_inputs/*.nc')
+            else:
+                forcings_path = os.path.join(basin_data_dir,'cwatm', "cwatm_inputs/*.nc")
+            # For CWatM, find the actual result file
+            cwatm_files = glob.glob(model_results_path)
+            if cwatm_files:
+                vic_results_path = cwatm_files[0]  # Use first matching file
+            else:
+                vic_results_path = model_results_path
         else:
-            forcings_path = os.path.join(basin_data_dir,'vic', "vic_inputs/*.nc")
+            # VIC paths (original behavior)
+            if(use_rout_state):
+                vic_results_path = rout_init_state_save_file
+            else:
+                if forecast_mode:
+                    vic_results_path = os.path.join(basin_data_dir,'vic', 'forecast_vic_outputs', "nc_fluxes."+start_date_str+".nc")
+                else:
+                    vic_results_path = os.path.join(basin_data_dir,'vic', "vic_outputs/nc_fluxes."+start_date_str+".nc")
+            if forecast_mode:
+                forcings_path = os.path.join(basin_data_dir,'vic', 'forecast_vic_inputs/*.nc')
+            else:
+                forcings_path = os.path.join(basin_data_dir,'vic', "vic_inputs/*.nc")
 
         for reservoir_no,reservoir in reservoirs.iterrows():
             ## Tmsos Evaporation
@@ -479,9 +591,9 @@ def run_postprocessing(basin_name, basin_data_dir, reservoir_shpfile, reservoir_
                 
                 if isinstance(sarea, float) or os.path.isfile(sarea):
                     log.debug(f"Calculating Evaporation for {reservoir_name}")
-                    calc_E(reservoir, start_date_str_evap, end_date_str, forcings_path, vic_results_path, sarea, e_path, forecast_mode=forecast_mode)
+                    calc_E(reservoir, start_date_str_evap, end_date_str, forcings_path, vic_results_path, sarea, e_path, forecast_mode=forecast_mode, hydro_model=hydro_model)
                 else:
-                    raise Exception("Surface area or VIC result file not found; skipping evaporation calculation")          
+                    raise Exception("Surface area or hydrological model result file not found; skipping evaporation calculation")          
             except:
                 log.exception(f"TMSOS based Evaporation for {reservoir_name} could not be calculated.")
                 no_failed_files +=1
@@ -509,7 +621,7 @@ def run_postprocessing(basin_name, basin_data_dir, reservoir_shpfile, reservoir_
                         )
                         # Evaporation calculation
                         log.debug(f"Running calc_E for {reservoir_name}, method {method}. Saving at {e_path}")
-                        calc_E(reservoir, start_date_str_evap, end_date_str, forcings_path, vic_results_path, sarea, e_path, forecast_mode=forecast_mode)
+                        calc_E(reservoir, start_date_str_evap, end_date_str, forcings_path, vic_results_path, sarea, e_path, forecast_mode=forecast_mode, hydro_model=hydro_model)
             except:
                 log.exception(f"SWOT based evaporation for {reservoir_name} could not be calculated.")
                 no_swot_failed_files += 1    

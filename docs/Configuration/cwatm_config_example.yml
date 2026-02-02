@@ -1,0 +1,182 @@
+# RAT Configuration Example for CWatM Integration
+# ================================================
+# This configuration file shows how to set up RAT to use CWatM
+# (Community Water Model) instead of VIC as the hydrological model.
+#
+# CWatM provides several advantages for reservoir-dominated basins:
+# - Explicit reservoir operation modeling
+# - Human water management (irrigation, groundwater extraction)
+# - Global coverage with consistent parameterization
+#
+# For more information about CWatM, see:
+# https://cwatm.iiasa.ac.at/
+
+GLOBAL:
+  project_dir: '/path/to/your/project'
+  data_dir: '/path/to/data/directory'
+  basin_shpfile: '/path/to/basin_shapefile.shp'
+  basin_shpfile_column_dict:
+    id: 'basin_id'
+    name: 'basin_name'
+  steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+  multiprocessing: 8
+
+  # IMPORTANT: Set hydrological model to 'cwatm' to use CWatM
+  # Options: 'vic' (default) or 'cwatm'
+  hydrological_model: 'cwatm'
+
+  # Optional: Elevation data for domain creation
+  elevation_tif_file: '/path/to/elevation.tif'
+
+  # Optional: GRWL file for water body identification
+  grwl: '/path/to/grwl.shp'
+
+BASIN:
+  region_name: 'your_region'
+  basin_name: 'your_basin'
+  basin_id: 1
+  start: 2020-01-01
+  end: 2020-12-31
+  spin_up: false
+
+  # VIC init state (also used for CWatM when available)
+  vic_init_state: 2019-12-31
+
+  # CWatM-specific init state (optional, overrides vic_init_state for CWatM)
+  # cwatm_init_state: '/path/to/cwatm_state.nc'
+
+# CWatM Configuration Section
+# ===========================
+CWATM:
+  # Path to CWatM installation directory
+  cwatm_path: '/path/to/cwatm/run_cwatm.py'
+
+  # Conda environment with CWatM dependencies
+  cwatm_env: 'cwatm_env'
+
+  # Optional: Conda hook script path
+  # conda_hook: '/path/to/conda/etc/profile.d/conda.sh'
+
+  # CWatM settings file template
+  # This file will be modified by RAT to set dates and paths
+  cwatm_settings_file: '/path/to/cwatm_settings_template.ini'
+
+  # CWatM workspace directory (optional)
+  cwatm_workspace: null
+
+  # Whether to use MetSim for forcing preparation (recommended)
+  # If false, RAT will convert combined NetCDF directly to CWatM format
+  use_metsim: true
+
+  # CWatM global data flag (similar to VIC)
+  cwatm_global_data: false
+
+  # Basin mask map (NetCDF or ASCII grid)
+  mask_map: '/path/to/basin_mask.nc'
+
+  # Local Drain Direction (LDD) map
+  ldd_map: '/path/to/ldd.nc'
+
+  # Reservoir configuration file for CWatM
+  reservoir_file: '/path/to/reservoir_data.nc'
+
+  # Whether to load initial state
+  init_load: false
+
+# MetSim Configuration (used for both VIC and CWatM forcing prep)
+# ================================================================
+METSIM:
+  metsim_env: 'metsim_env'
+  metsim_param_file: '/path/to/metsim_params.yaml'
+  metsim_domain_file: '/path/to/domain.nc'
+  historical_precipitation: null
+
+# VIC Configuration (kept for reference, not used when hydrological_model='cwatm')
+# ================================================================================
+VIC:
+  vic_env: 'vic_env'
+  vic_global_data: true
+  vic_global_param_dir: '/path/to/vic/global_params'
+  vic_basin_continent_param_filename: 'vic_params.nc'
+  vic_basin_continent_domain_filename: 'vic_domain.nc'
+  vic_soil_param_file: null
+  vic_domain_file: null
+
+VIC PARAMETERS: null
+
+# CWatM-specific Parameters (optional overrides)
+# ==============================================
+CWATM PARAMETERS:
+  # Override any CWatM settings here
+  # These will be applied to the CWatM settings file
+  # includeReservoirs: True
+  # useResAndLakes: True
+
+# Routing Configuration
+# =====================
+ROUTING:
+  route_model: '/path/to/routing/model'
+  station_global_data: true
+  global_flow_dir_tif_file: '/path/to/flow_direction.tif'
+  stations_vector_file: '/path/to/stations.shp'
+  stations_vector_file_columns_dict:
+    name: 'station_name'
+    lat: 'lat'
+    lon: 'lon'
+  station_latlon_path: null
+  replace_flow_directions: null
+
+ROUTING PARAMETERS:
+  uh: '/path/to/uh.txt'
+  station_file: null
+  flow_direction_file: null
+
+# Google Earth Engine Configuration
+# ==================================
+GEE:
+  reservoir_vector_file: '/path/to/reservoirs.shp'
+  reservoir_vector_file_columns_dict:
+    dam_name_column: 'dam_name'
+    area_column: 'area_km2'
+    lat_column: 'lat'
+    lon_column: 'lon'
+  bot_filter: null
+
+# Altimeter Configuration
+# =======================
+ALTIMETER:
+  altimeter_source: 'jason3'
+
+# Post-Processing Configuration
+# =============================
+POST_PROCESSING:
+  aec_dir: null
+  catchment_vector_file: null
+  catchment_vector_file_columns_dict: null
+
+# Plugins Configuration
+# =====================
+PLUGINS:
+  forecast: false
+  resorr: false
+  swot: false
+  swot_prior_lake_shpfile: null
+  swot_prior_lake_shpfile_column_dict: null
+
+# Clean-up Configuration
+# ======================
+CLEAN_UP:
+  clean_previous_outputs: false
+  clean_processing: false
+  clean_metsim: false
+  clean_vic: false
+  clean_routing: false
+  clean_gee: false
+  clean_altimetry: false
+  clean_basin_parameter_files: false
+  clean_basin_meteorological_data: false
+
+# Confidential Settings
+# =====================
+CONFIDENTIAL:
+  secrets: '/path/to/secrets.json'
