@@ -10,11 +10,13 @@ and water withdrawals.
 """
 
 import os
+import sys
 import csv
 import math
 import time
 import datetime
 import subprocess
+import platform
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -27,6 +29,9 @@ from rat.utils.logging import LOG_NAME, LOG_LEVEL, NOTIFICATION
 from rat.utils.utils import create_directory
 from rat.utils.run_command import run_command
 from rat.core.hydro_model import HydrologicalModel, ModelFactory
+
+# Detect operating system
+IS_WINDOWS = platform.system() == 'Windows'
 
 log = getLogger(LOG_NAME)
 log.setLevel(LOG_LEVEL)
@@ -177,29 +182,51 @@ class CWatMRunner(HydrologicalModel):
             log.error("CWatM settings file not configured")
             return 1
 
-        # Build the CWatM command
-        if self.cwatm_env:
-            # Running with conda environment
-            if self.conda_hook:
+        # Build the CWatM command based on operating system
+        if IS_WINDOWS:
+            # Windows-specific command building
+            if self.cwatm_env:
+                # Using conda on Windows
                 cmd = (
-                    f"source {self.conda_hook} && "
-                    f"conda activate {self.cwatm_env} && "
-                    f"python {self.cwatm_path} {self.settings_file}"
+                    f'conda activate {self.cwatm_env} && '
+                    f'python "{self.cwatm_path}" "{self.settings_file}"'
                 )
+                shell_executable = None  # Use default shell (cmd.exe)
             else:
-                cmd = (
-                    f'eval "$(conda shell.bash hook)" && '
-                    f"conda activate {self.cwatm_env} && "
-                    f"python {self.cwatm_path} {self.settings_file}"
-                )
+                cmd = f'python "{self.cwatm_path}" "{self.settings_file}"'
+                shell_executable = None
         else:
-            # Running without conda (assumes CWatM is in PATH)
-            cmd = f"python {self.cwatm_path} {self.settings_file}"
+            # Linux/Unix command building
+            if self.cwatm_env:
+                # Running with conda environment
+                if self.conda_hook:
+                    cmd = (
+                        f"source {self.conda_hook} && "
+                        f"conda activate {self.cwatm_env} && "
+                        f"python {self.cwatm_path} {self.settings_file}"
+                    )
+                else:
+                    cmd = (
+                        f'eval "$(conda shell.bash hook)" && '
+                        f"conda activate {self.cwatm_env} && "
+                        f"python {self.cwatm_path} {self.settings_file}"
+                    )
+                shell_executable = "/bin/bash"
+            else:
+                # Running without conda (assumes CWatM is in PATH)
+                cmd = f"python {self.cwatm_path} {self.settings_file}"
+                shell_executable = "/bin/bash"
 
         log.debug(f"Running command: {cmd}")
+        log.debug(f"Operating system: {'Windows' if IS_WINDOWS else 'Linux/Unix'}")
 
         try:
-            ret_code = run_command(cmd, shell=True, executable="/bin/bash")
+            if IS_WINDOWS:
+                # On Windows, run through cmd.exe
+                ret_code = subprocess.call(cmd, shell=True)
+            else:
+                ret_code = run_command(cmd, shell=True, executable=shell_executable)
+
             if ret_code != 0:
                 log.error(f"CWatM execution failed with return code: {ret_code}")
             else:
